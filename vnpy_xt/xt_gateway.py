@@ -18,7 +18,7 @@ from xtquant.xttype import (
 )
 from filelock import FileLock, Timeout
 
-from vnpy.event import EventEngine, EVENT_TIMER
+from vnpy.event import EventEngine, EVENT_TIMER, Event
 from vnpy.trader.gateway import BaseGateway
 from vnpy.trader.object import (
     OrderRequest,
@@ -37,6 +37,7 @@ from vnpy.trader.object import (
     TradeData,
     Offset,
 )
+from vnpy.trader.event import EVENT_GATEWAY_CONNECTED
 from vnpy.trader.constant import Exchange, Product
 from vnpy.trader.utility import ZoneInfo, get_file_path, round_to
 from vnpy.trader.ui.utilities import RegisteredQWidgetType
@@ -140,9 +141,11 @@ class XtGateway(BaseGateway):
 
     default_setting: dict[str, str] = {
         "token": ("", RegisteredQWidgetType.GW_PASSWORDBOX),
+        "VIP服务器": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "股票市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "期货市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "股票期权市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
+        "期货/指数期权市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "允许交易": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "QMT路径": ("", RegisteredQWidgetType.GW_EDITBOX),
         "股票资金账号": ("", RegisteredQWidgetType.GW_EDITBOX),
@@ -150,7 +153,10 @@ class XtGateway(BaseGateway):
         "股票期权资金账号": ("", RegisteredQWidgetType.GW_EDITBOX),
     }
 
-    exchanges: list[str] = list(EXCHANGE_VT2XT.keys())
+    @property
+    def exchanges(self) -> list[str]:
+        """查询交易所"""
+        return self.md_api.available_exchange
 
     def __init__(self, event_engine: EventEngine, gateway_name: str) -> None:
         """构造函数"""
@@ -161,7 +167,6 @@ class XtGateway(BaseGateway):
 
         self.trading: bool = False
         self.orders: dict[str, OrderData] = {}
-        self.contracts: dict[str, ContractData] = {}
 
         self.thread: Optional[Thread] = None
 
@@ -179,9 +184,10 @@ class XtGateway(BaseGateway):
 
         stock_active: bool = setting["股票市场"]
         futures_active: bool = setting["期货市场"]
-        option_active: bool = setting["股票期权市场"]
+        etf_option_active: bool = setting["股票期权市场"]
+        fut_option_active: bool = setting["期货/指数期权市场"]
 
-        self.md_api.connect(token, stock_active, futures_active, option_active)
+        self.md_api.connect(token, stock_active, futures_active, etf_option_active, fut_option_active)
 
         self.trading = setting["允许交易"]
         if self.trading:
@@ -190,14 +196,16 @@ class XtGateway(BaseGateway):
             accounts_with_type: dict = {}
             if stock_active:
                 accounts_with_type[setting["股票资金账号"]] = "STOCK"
-            if futures_active:
+            if futures_active or fut_option_active:
                 accounts_with_type[setting["期货资金账号"]] = "FUTURE"
-            if option_active:
+            if etf_option_active:
                 accounts_with_type[setting["股票期权资金账号"]] = "STOCK_OPTION"
 
             # for accountid, account_type in accounts_with_type.items():
             self.td_api.connect(path, accounts_with_type)
             self.init_query()
+        event: Event = Event(EVENT_GATEWAY_CONNECTED, data=self.gateway_name)
+        self.event_engine.put(event)
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
@@ -233,11 +241,6 @@ class XtGateway(BaseGateway):
         """推送委托数据"""
         self.orders[order.orderid] = order
         super().on_order(order)
-
-    def on_contract(self, contract: ContractData) -> None:
-        """推送合约数据"""
-        self.contracts[contract.symbol] = contract
-        super().on_contract(contract)
 
     def get_order(self, orderid: str) -> OrderData:
         """查询委托数据"""
@@ -284,6 +287,9 @@ class XtMdApi:
         self.stock_active: bool = False
         self.futures_active: bool = False
         self.option_active: bool = False
+        self.fut_option_active: bool = False
+
+        self.available_exchange: list[Exchange] = []
 
     def onMarketData(self, data: dict) -> None:
         """行情推送回调"""
@@ -345,7 +351,15 @@ class XtMdApi:
 
                 self.gateway.on_tick(tick)
 
-    def connect(self, token: str, stock_active: bool, futures_active: bool, option_active: bool) -> None:
+    def connect(
+        self,
+        token: str,
+        stock_active: bool,
+        futures_active: bool,
+        option_active: bool,
+        fut_option_active: bool,
+        vip_server_only: bool = True,
+    ) -> None:
         """连接"""
         self.gateway.write_log("开始启动行情服务，请稍等")
 
@@ -353,13 +367,14 @@ class XtMdApi:
         self.stock_active = stock_active
         self.futures_active = futures_active
         self.option_active = option_active
+        self.fut_option_active = fut_option_active
 
         if self.inited:
             self.gateway.write_log("行情接口已经初始化，请勿重复操作")
             return
 
         try:
-            self.init_xtdc()
+            self.init_xtdc(vip_server_only)
 
             # 尝试查询合约信息，确认连接成功
             xtdata.get_instrument_detail("000001.SZ")
@@ -382,13 +397,24 @@ class XtMdApi:
         except Timeout:
             return False
 
-    def init_xtdc(self) -> None:
+    def init_xtdc(self, vip_server_only) -> None:
         """初始化xtdc服务进程"""
         if not self.get_lock():
             return
 
         # 设置token
         xtdc.set_token(self.token)
+
+        # 设置是否只连接VIP服务器
+        if vip_server_only:
+            xtdc.set_allow_optmize_address(
+                [
+                    "115.231.218.73:55310",
+                    "115.231.218.79:55310",
+                    "218.16.123.11:55310",
+                    "218.16.123.27:55310",
+                ]
+            )
 
         # 开启使用期货真实夜盘时间
         xtdc.set_future_realtime_mode(True)
@@ -416,6 +442,9 @@ class XtMdApi:
         """查询股票合约信息"""
         xt_symbols: list[str] = []
         markets: list = ["沪深A股", "沪深转债", "沪深ETF", "沪深指数", "京市A股"]
+        new_exchanges = [Exchange.SSE, Exchange.SZSE, Exchange.BSE]
+        new_exchanges = [exchange for exchange in new_exchanges if exchange not in self.available_exchange]
+        self.available_exchange.extend(new_exchanges)
 
         for i in markets:
             names: list = xtdata.get_stock_list_in_sector(i)
@@ -469,6 +498,9 @@ class XtMdApi:
         """查询期货合约信息"""
         xt_symbols: list[str] = []
         markets: list = ["中金所期货", "上期所期货", "能源中心期货", "大商所期货", "郑商所期货", "广期所期货"]
+        new_exchanges = [Exchange.SHFE, Exchange.CFFEX, Exchange.INE, Exchange.DCE, Exchange.CZCE, Exchange.GFEX]
+        new_exchanges = [exchange for exchange in new_exchanges if exchange not in self.available_exchange]
+        self.available_exchange.extend(new_exchanges)
 
         for i in markets:
             names: list = xtdata.get_stock_list_in_sector(i)
@@ -518,16 +550,24 @@ class XtMdApi:
         """查询期权合约信息"""
         xt_symbols: list[str] = []
 
-        markets: list = [
-            "上证期权",
-            "深证期权",
-            "中金所期权",
-            "上期所期权",
-            "能源中心期权",
-            "大商所期权",
-            "郑商所期权",
-            "广期所期权",
-        ]
+        markets: list[str] = []
+        new_exchanges: list[Exchange] = []
+        if self.option_active:
+            markets.extend(
+                [
+                    "上证期权",
+                    "深证期权",
+                ]
+            )
+            new_exchanges.extend([Exchange.SSE, Exchange.SZSE])
+        if self.fut_option_active:
+            markets.extend(["中金所期权", "上期所期权", "能源中心期权", "大商所期权", "郑商所期权", "广期所期权"])
+            new_exchanges.extend(
+                [Exchange.CFFEX, Exchange.SHFE, Exchange.INE, Exchange.DCE, Exchange.CZCE, Exchange.GFEX]
+            )
+
+        new_exchanges = [exchange for exchange in new_exchanges if exchange not in self.available_exchange]
+        self.available_exchange.extend(new_exchanges)
 
         for i in markets:
             names: list = xtdata.get_stock_list_in_sector(i)
@@ -543,6 +583,9 @@ class XtMdApi:
                 contract = process_futures_option(xtdata.get_instrument_detail, xt_symbol, self.gateway_name)
 
             if contract:
+                # for CZCE options, xt will return two contracts for one option, one with one digit for year, which is the current official contract, and one with two digits for year, which is for long history convience, we just ignore the latter
+                if contract.vt_symbol in symbol_contract_map:
+                    continue
                 symbol_contract_map[contract.vt_symbol] = contract
 
                 self.gateway.on_contract(contract)
@@ -561,9 +604,6 @@ class XtMdApi:
         if xt_symbol not in self.subscribed:
             xtdata.subscribe_quote(stock_code=xt_symbol, period="tick", callback=self.onMarketData)
             self.subscribed.add(xt_symbol)
-
-    def close(self) -> None:
-        """关闭连接"""
 
 
 class XtTdApi(XtQuantTraderCallback):
