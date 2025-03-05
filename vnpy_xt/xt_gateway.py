@@ -293,63 +293,70 @@ class XtMdApi:
 
     def onMarketData(self, data: dict) -> None:
         """行情推送回调"""
+        def parse_data_dict(xt_symbol, d: dict) -> TickData:
+            symbol, xt_exchange = xt_symbol.split(".")
+            exchange = EXCHANGE_XT2VT[xt_exchange]
+
+            tick: TickData = TickData(
+                symbol=symbol,
+                exchange=exchange,
+                datetime=generate_datetime(d["time"]),
+                volume=d["volume"],
+                turnover=d["amount"],
+                open_interest=d["openInt"],
+                gateway_name=self.gateway_name,
+            )
+
+            contract = symbol_contract_map[tick.vt_symbol]
+            tick.name = contract.name
+
+            bp_data: list = d["bidPrice"]
+            ap_data: list = d["askPrice"]
+            bv_data: list = d["bidVol"]
+            av_data: list = d["askVol"]
+
+            tick.bid_price_1 = round_to(bp_data[0], contract.pricetick)
+            tick.bid_price_2 = round_to(bp_data[1], contract.pricetick)
+            tick.bid_price_3 = round_to(bp_data[2], contract.pricetick)
+            tick.bid_price_4 = round_to(bp_data[3], contract.pricetick)
+            tick.bid_price_5 = round_to(bp_data[4], contract.pricetick)
+
+            tick.ask_price_1 = round_to(ap_data[0], contract.pricetick)
+            tick.ask_price_2 = round_to(ap_data[1], contract.pricetick)
+            tick.ask_price_3 = round_to(ap_data[2], contract.pricetick)
+            tick.ask_price_4 = round_to(ap_data[3], contract.pricetick)
+            tick.ask_price_5 = round_to(ap_data[4], contract.pricetick)
+
+            tick.bid_volume_1 = bv_data[0]
+            tick.bid_volume_2 = bv_data[1]
+            tick.bid_volume_3 = bv_data[2]
+            tick.bid_volume_4 = bv_data[3]
+            tick.bid_volume_5 = bv_data[4]
+
+            tick.ask_volume_1 = av_data[0]
+            tick.ask_volume_2 = av_data[1]
+            tick.ask_volume_3 = av_data[2]
+            tick.ask_volume_4 = av_data[3]
+            tick.ask_volume_5 = av_data[4]
+
+            tick.last_price = round_to(d["lastPrice"], contract.pricetick)
+            tick.open_price = round_to(d["open"], contract.pricetick)
+            tick.high_price = round_to(d["high"], contract.pricetick)
+            tick.low_price = round_to(d["low"], contract.pricetick)
+            tick.pre_close = round_to(d["lastClose"], contract.pricetick)
+
+            if tick.vt_symbol in symbol_limit_map:
+                tick.limit_up, tick.limit_down = symbol_limit_map[tick.vt_symbol]
+            return tick
+
         for xt_symbol, buf in data.items():
-            for d in buf:
-                symbol, xt_exchange = xt_symbol.split(".")
-                exchange = EXCHANGE_XT2VT[xt_exchange]
-
-                tick: TickData = TickData(
-                    symbol=symbol,
-                    exchange=exchange,
-                    datetime=generate_datetime(d["time"]),
-                    volume=d["volume"],
-                    turnover=d["amount"],
-                    open_interest=d["openInt"],
-                    gateway_name=self.gateway_name,
-                )
-
-                contract = symbol_contract_map[tick.vt_symbol]
-                tick.name = contract.name
-
-                bp_data: list = d["bidPrice"]
-                ap_data: list = d["askPrice"]
-                bv_data: list = d["bidVol"]
-                av_data: list = d["askVol"]
-
-                tick.bid_price_1 = round_to(bp_data[0], contract.pricetick)
-                tick.bid_price_2 = round_to(bp_data[1], contract.pricetick)
-                tick.bid_price_3 = round_to(bp_data[2], contract.pricetick)
-                tick.bid_price_4 = round_to(bp_data[3], contract.pricetick)
-                tick.bid_price_5 = round_to(bp_data[4], contract.pricetick)
-
-                tick.ask_price_1 = round_to(ap_data[0], contract.pricetick)
-                tick.ask_price_2 = round_to(ap_data[1], contract.pricetick)
-                tick.ask_price_3 = round_to(ap_data[2], contract.pricetick)
-                tick.ask_price_4 = round_to(ap_data[3], contract.pricetick)
-                tick.ask_price_5 = round_to(ap_data[4], contract.pricetick)
-
-                tick.bid_volume_1 = bv_data[0]
-                tick.bid_volume_2 = bv_data[1]
-                tick.bid_volume_3 = bv_data[2]
-                tick.bid_volume_4 = bv_data[3]
-                tick.bid_volume_5 = bv_data[4]
-
-                tick.ask_volume_1 = av_data[0]
-                tick.ask_volume_2 = av_data[1]
-                tick.ask_volume_3 = av_data[2]
-                tick.ask_volume_4 = av_data[3]
-                tick.ask_volume_5 = av_data[4]
-
-                tick.last_price = round_to(d["lastPrice"], contract.pricetick)
-                tick.open_price = round_to(d["open"], contract.pricetick)
-                tick.high_price = round_to(d["high"], contract.pricetick)
-                tick.low_price = round_to(d["low"], contract.pricetick)
-                tick.pre_close = round_to(d["lastClose"], contract.pricetick)
-
-                if tick.vt_symbol in symbol_limit_map:
-                    tick.limit_up, tick.limit_down = symbol_limit_map[tick.vt_symbol]
-
+            if isinstance(buf, dict):
+                tick = parse_data_dict(xt_symbol, buf)
                 self.gateway.on_tick(tick)
+            elif isinstance(buf, list):
+                for d in buf:
+                    tick = parse_data_dict(xt_symbol, d)
+                    self.gateway.on_tick(tick)
 
     def connect(
         self,
@@ -602,7 +609,8 @@ class XtMdApi:
         xt_symbol: str = req.symbol + "." + xt_exchange
 
         if xt_symbol not in self.subscribed:
-            xtdata.subscribe_quote(stock_code=xt_symbol, period="tick", callback=self.onMarketData)
+            #xtdata.subscribe_quote(stock_code=xt_symbol, period="tick", callback=self.onMarketData)
+            xtdata.subscribe_whole_quote([xt_symbol], callback=self.onMarketData)
             self.subscribed.add(xt_symbol)
 
 
