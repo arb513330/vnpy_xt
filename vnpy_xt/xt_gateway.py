@@ -140,6 +140,8 @@ class XtGateway(BaseGateway):
     default_name: str = "XT"
 
     default_setting: dict[str, str] = {
+        "连接IP": ("127.0.0.1", RegisteredQWidgetType.GW_EDITBOX),
+        "连接端口": (58609, RegisteredQWidgetType.GW_INTBOX),
         "token": ("", RegisteredQWidgetType.GW_PASSWORDBOX),
         "VIP服务器": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "股票市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
@@ -154,7 +156,7 @@ class XtGateway(BaseGateway):
     }
 
     @property
-    def exchanges(self) -> list[str]:
+    def exchanges(self) -> list[Exchange]:
         """查询交易所"""
         return self.md_api.available_exchange
 
@@ -180,6 +182,8 @@ class XtGateway(BaseGateway):
 
     def _connect(self, setting: dict) -> None:
         """连接交易接口"""
+        ip: str = setting["连接IP"]
+        port: int = int(setting["连接端口"])
         token: str = setting["token"]
 
         stock_active: bool = setting["股票市场"]
@@ -187,7 +191,7 @@ class XtGateway(BaseGateway):
         etf_option_active: bool = setting["股票期权市场"]
         fut_option_active: bool = setting["期货/指数期权市场"]
 
-        self.md_api.connect(token, stock_active, futures_active, etf_option_active, fut_option_active)
+        self.md_api.connect(ip, port, token, stock_active, futures_active, etf_option_active, fut_option_active)
 
         self.trading = setting["允许交易"]
         if self.trading:
@@ -283,6 +287,8 @@ class XtMdApi:
         self.inited: bool = False
         self.subscribed: set = set()
 
+        self.ip: str = ""
+        self.port: int = 0
         self.token: str = ""
         self.stock_active: bool = False
         self.futures_active: bool = False
@@ -360,6 +366,8 @@ class XtMdApi:
 
     def connect(
         self,
+        ip: str,
+        port: int,
         token: str,
         stock_active: bool,
         futures_active: bool,
@@ -370,6 +378,8 @@ class XtMdApi:
         """连接"""
         self.gateway.write_log("开始启动行情服务，请稍等")
 
+        self.ip = ip
+        self.port = port
         self.token = token
         self.stock_active = stock_active
         self.futures_active = futures_active
@@ -380,19 +390,30 @@ class XtMdApi:
             self.gateway.write_log("行情接口已经初始化，请勿重复操作")
             return
 
-        try:
-            self.init_xtdc(vip_server_only)
-
-            # 尝试查询合约信息，确认连接成功
-            xtdata.get_instrument_detail("000001.SZ")
-        except Exception as ex:
-            self.gateway.write_log(f"迅投研数据服务初始化失败，发生异常：{ex}")
+        if self.ip == "" or self.port <= 0 or not self._connect_to_existing_xtdc(self.ip, self.port):
+            if self.ip == "127.0.0.1" or self.ip == "localhost":
+                self.port = self.init_xtdc(vip_server_only)
+                client = xtdata.connect(port=self.port)
+                if not client.is_connected():
+                    self.gateway.write_log("迅投研数据服务初始化失败，请检查日志")
+                    return
+            else:
+                self.gateway.write_log(f"远程迅投研数据服务{self.ip}:{self.port}连接失败")
+                return
 
         self.inited = True
 
         self.gateway.write_log("行情接口连接成功")
 
         self.query_contracts()
+
+    def _connect_to_existing_xtdc(self, ip: str, port: int) -> bool:
+        """连接到已经存在的行情服务"""
+        client = xtdata.connect(ip, port)
+        if client.is_connected():
+            self.gateway.write_log("连接到已经存在的行情服务")
+            return True
+        return False
 
     def get_lock(self) -> bool:
         """获取文件锁，确保单例运行"""
@@ -404,10 +425,10 @@ class XtMdApi:
         except Timeout:
             return False
 
-    def init_xtdc(self, vip_server_only) -> None:
+    def init_xtdc(self, vip_server_only) -> int:
         """初始化xtdc服务进程"""
         if not self.get_lock():
-            return
+            return 0
 
         # 设置token
         xtdc.set_token(self.token)
@@ -430,7 +451,7 @@ class XtMdApi:
         xtdc.init(False)
 
         # 设置监听端口58620
-        xtdc.listen(port=58620)
+        return xtdc.listen(port=(self.port, self.port + 50))
 
     def query_contracts(self) -> None:
         """查询合约信息"""
