@@ -18,7 +18,7 @@ from xtquant.xttype import (
 )
 from filelock import FileLock, Timeout
 
-from vnpy.event import EventEngine, EVENT_TIMER
+from vnpy.event import EventEngine, EVENT_TIMER, Event
 from vnpy.trader.gateway import BaseGateway
 from vnpy.trader.object import (
     OrderRequest,
@@ -37,6 +37,7 @@ from vnpy.trader.object import (
     TradeData,
     Offset,
 )
+from vnpy.trader.event import EVENT_GATEWAY_CONNECTED
 from vnpy.trader.constant import Exchange, Product
 from vnpy.trader.utility import ZoneInfo, get_file_path, round_to
 from vnpy.trader.ui.utilities import RegisteredQWidgetType
@@ -139,10 +140,14 @@ class XtGateway(BaseGateway):
     default_name: str = "XT"
 
     default_setting: dict[str, str] = {
+        "连接IP": ("127.0.0.1", RegisteredQWidgetType.GW_EDITBOX),
+        "连接端口": (58609, RegisteredQWidgetType.GW_INTBOX),
         "token": ("", RegisteredQWidgetType.GW_PASSWORDBOX),
+        "VIP服务器": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "股票市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "期货市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "股票期权市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
+        "期货/指数期权市场": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "允许交易": (True, RegisteredQWidgetType.GW_CHECKBOX),
         "QMT路径": ("", RegisteredQWidgetType.GW_EDITBOX),
         "股票资金账号": ("", RegisteredQWidgetType.GW_EDITBOX),
@@ -150,7 +155,10 @@ class XtGateway(BaseGateway):
         "股票期权资金账号": ("", RegisteredQWidgetType.GW_EDITBOX),
     }
 
-    exchanges: list[str] = list(EXCHANGE_VT2XT.keys())
+    @property
+    def exchanges(self) -> list[Exchange]:
+        """查询交易所"""
+        return self.md_api.available_exchange
 
     def __init__(self, event_engine: EventEngine, gateway_name: str) -> None:
         """构造函数"""
@@ -161,7 +169,6 @@ class XtGateway(BaseGateway):
 
         self.trading: bool = False
         self.orders: dict[str, OrderData] = {}
-        self.contracts: dict[str, ContractData] = {}
 
         self.thread: Optional[Thread] = None
 
@@ -175,13 +182,16 @@ class XtGateway(BaseGateway):
 
     def _connect(self, setting: dict) -> None:
         """连接交易接口"""
+        ip: str = setting["连接IP"]
+        port: int = int(setting["连接端口"])
         token: str = setting["token"]
 
         stock_active: bool = setting["股票市场"]
         futures_active: bool = setting["期货市场"]
-        option_active: bool = setting["股票期权市场"]
+        etf_option_active: bool = setting["股票期权市场"]
+        fut_option_active: bool = setting["期货/指数期权市场"]
 
-        self.md_api.connect(token, stock_active, futures_active, option_active)
+        self.md_api.connect(ip, port, token, stock_active, futures_active, etf_option_active, fut_option_active)
 
         self.trading = setting["允许交易"]
         if self.trading:
@@ -190,14 +200,16 @@ class XtGateway(BaseGateway):
             accounts_with_type: dict = {}
             if stock_active:
                 accounts_with_type[setting["股票资金账号"]] = "STOCK"
-            if futures_active:
+            if futures_active or fut_option_active:
                 accounts_with_type[setting["期货资金账号"]] = "FUTURE"
-            if option_active:
+            if etf_option_active:
                 accounts_with_type[setting["股票期权资金账号"]] = "STOCK_OPTION"
 
             # for accountid, account_type in accounts_with_type.items():
             self.td_api.connect(path, accounts_with_type)
             self.init_query()
+        event: Event = Event(EVENT_GATEWAY_CONNECTED, data=self.gateway_name)
+        self.event_engine.put(event)
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
@@ -233,11 +245,6 @@ class XtGateway(BaseGateway):
         """推送委托数据"""
         self.orders[order.orderid] = order
         super().on_order(order)
-
-    def on_contract(self, contract: ContractData) -> None:
-        """推送合约数据"""
-        self.contracts[contract.symbol] = contract
-        super().on_contract(contract)
 
     def get_order(self, orderid: str) -> OrderData:
         """查询委托数据"""
@@ -280,97 +287,133 @@ class XtMdApi:
         self.inited: bool = False
         self.subscribed: set = set()
 
+        self.ip: str = ""
+        self.port: int = 0
         self.token: str = ""
         self.stock_active: bool = False
         self.futures_active: bool = False
         self.option_active: bool = False
+        self.fut_option_active: bool = False
+
+        self.available_exchange: list[Exchange] = []
 
     def onMarketData(self, data: dict) -> None:
         """行情推送回调"""
+        def parse_data_dict(xt_symbol, d: dict) -> TickData:
+            symbol, xt_exchange = xt_symbol.split(".")
+            exchange = EXCHANGE_XT2VT[xt_exchange]
+
+            tick: TickData = TickData(
+                symbol=symbol,
+                exchange=exchange,
+                datetime=generate_datetime(d["time"]),
+                volume=d["volume"],
+                turnover=d["amount"],
+                open_interest=d["openInt"],
+                gateway_name=self.gateway_name,
+            )
+
+            contract = symbol_contract_map[tick.vt_symbol]
+            tick.name = contract.name
+
+            bp_data: list = d["bidPrice"]
+            ap_data: list = d["askPrice"]
+            bv_data: list = d["bidVol"]
+            av_data: list = d["askVol"]
+
+            tick.bid_price_1 = round_to(bp_data[0], contract.pricetick)
+            tick.bid_price_2 = round_to(bp_data[1], contract.pricetick)
+            tick.bid_price_3 = round_to(bp_data[2], contract.pricetick)
+            tick.bid_price_4 = round_to(bp_data[3], contract.pricetick)
+            tick.bid_price_5 = round_to(bp_data[4], contract.pricetick)
+
+            tick.ask_price_1 = round_to(ap_data[0], contract.pricetick)
+            tick.ask_price_2 = round_to(ap_data[1], contract.pricetick)
+            tick.ask_price_3 = round_to(ap_data[2], contract.pricetick)
+            tick.ask_price_4 = round_to(ap_data[3], contract.pricetick)
+            tick.ask_price_5 = round_to(ap_data[4], contract.pricetick)
+
+            tick.bid_volume_1 = bv_data[0]
+            tick.bid_volume_2 = bv_data[1]
+            tick.bid_volume_3 = bv_data[2]
+            tick.bid_volume_4 = bv_data[3]
+            tick.bid_volume_5 = bv_data[4]
+
+            tick.ask_volume_1 = av_data[0]
+            tick.ask_volume_2 = av_data[1]
+            tick.ask_volume_3 = av_data[2]
+            tick.ask_volume_4 = av_data[3]
+            tick.ask_volume_5 = av_data[4]
+
+            tick.last_price = round_to(d["lastPrice"], contract.pricetick)
+            tick.open_price = round_to(d["open"], contract.pricetick)
+            tick.high_price = round_to(d["high"], contract.pricetick)
+            tick.low_price = round_to(d["low"], contract.pricetick)
+            tick.pre_close = round_to(d["lastClose"], contract.pricetick)
+
+            if tick.vt_symbol in symbol_limit_map:
+                tick.limit_up, tick.limit_down = symbol_limit_map[tick.vt_symbol]
+            return tick
+
         for xt_symbol, buf in data.items():
-            for d in buf:
-                symbol, xt_exchange = xt_symbol.split(".")
-                exchange = EXCHANGE_XT2VT[xt_exchange]
-
-                tick: TickData = TickData(
-                    symbol=symbol,
-                    exchange=exchange,
-                    datetime=generate_datetime(d["time"]),
-                    volume=d["volume"],
-                    turnover=d["amount"],
-                    open_interest=d["openInt"],
-                    gateway_name=self.gateway_name,
-                )
-
-                contract = symbol_contract_map[tick.vt_symbol]
-                tick.name = contract.name
-
-                bp_data: list = d["bidPrice"]
-                ap_data: list = d["askPrice"]
-                bv_data: list = d["bidVol"]
-                av_data: list = d["askVol"]
-
-                tick.bid_price_1 = round_to(bp_data[0], contract.pricetick)
-                tick.bid_price_2 = round_to(bp_data[1], contract.pricetick)
-                tick.bid_price_3 = round_to(bp_data[2], contract.pricetick)
-                tick.bid_price_4 = round_to(bp_data[3], contract.pricetick)
-                tick.bid_price_5 = round_to(bp_data[4], contract.pricetick)
-
-                tick.ask_price_1 = round_to(ap_data[0], contract.pricetick)
-                tick.ask_price_2 = round_to(ap_data[1], contract.pricetick)
-                tick.ask_price_3 = round_to(ap_data[2], contract.pricetick)
-                tick.ask_price_4 = round_to(ap_data[3], contract.pricetick)
-                tick.ask_price_5 = round_to(ap_data[4], contract.pricetick)
-
-                tick.bid_volume_1 = bv_data[0]
-                tick.bid_volume_2 = bv_data[1]
-                tick.bid_volume_3 = bv_data[2]
-                tick.bid_volume_4 = bv_data[3]
-                tick.bid_volume_5 = bv_data[4]
-
-                tick.ask_volume_1 = av_data[0]
-                tick.ask_volume_2 = av_data[1]
-                tick.ask_volume_3 = av_data[2]
-                tick.ask_volume_4 = av_data[3]
-                tick.ask_volume_5 = av_data[4]
-
-                tick.last_price = round_to(d["lastPrice"], contract.pricetick)
-                tick.open_price = round_to(d["open"], contract.pricetick)
-                tick.high_price = round_to(d["high"], contract.pricetick)
-                tick.low_price = round_to(d["low"], contract.pricetick)
-                tick.pre_close = round_to(d["lastClose"], contract.pricetick)
-
-                if tick.vt_symbol in symbol_limit_map:
-                    tick.limit_up, tick.limit_down = symbol_limit_map[tick.vt_symbol]
-
+            if isinstance(buf, dict):
+                tick = parse_data_dict(xt_symbol, buf)
                 self.gateway.on_tick(tick)
+            elif isinstance(buf, list):
+                for d in buf:
+                    tick = parse_data_dict(xt_symbol, d)
+                    self.gateway.on_tick(tick)
 
-    def connect(self, token: str, stock_active: bool, futures_active: bool, option_active: bool) -> None:
+    def connect(
+        self,
+        ip: str,
+        port: int,
+        token: str,
+        stock_active: bool,
+        futures_active: bool,
+        option_active: bool,
+        fut_option_active: bool,
+        vip_server_only: bool = True,
+    ) -> None:
         """连接"""
         self.gateway.write_log("开始启动行情服务，请稍等")
 
+        self.ip = ip
+        self.port = port
         self.token = token
         self.stock_active = stock_active
         self.futures_active = futures_active
         self.option_active = option_active
+        self.fut_option_active = fut_option_active
 
         if self.inited:
             self.gateway.write_log("行情接口已经初始化，请勿重复操作")
             return
 
-        try:
-            self.init_xtdc()
-
-            # 尝试查询合约信息，确认连接成功
-            xtdata.get_instrument_detail("000001.SZ")
-        except Exception as ex:
-            self.gateway.write_log(f"迅投研数据服务初始化失败，发生异常：{ex}")
+        if self.ip == "" or self.port <= 0 or not self._connect_to_existing_xtdc(self.ip, self.port):
+            if self.ip == "127.0.0.1" or self.ip == "localhost":
+                self.port = self.init_xtdc(vip_server_only)
+                client = xtdata.connect(port=self.port)
+                if not client.is_connected():
+                    self.gateway.write_log("迅投研数据服务初始化失败，请检查日志")
+                    return
+            else:
+                self.gateway.write_log(f"远程迅投研数据服务{self.ip}:{self.port}连接失败")
+                return
 
         self.inited = True
 
         self.gateway.write_log("行情接口连接成功")
 
         self.query_contracts()
+
+    def _connect_to_existing_xtdc(self, ip: str, port: int) -> bool:
+        """连接到已经存在的行情服务"""
+        client = xtdata.connect(ip, port)
+        if client.is_connected():
+            self.gateway.write_log("连接到已经存在的行情服务")
+            return True
+        return False
 
     def get_lock(self) -> bool:
         """获取文件锁，确保单例运行"""
@@ -382,13 +425,24 @@ class XtMdApi:
         except Timeout:
             return False
 
-    def init_xtdc(self) -> None:
+    def init_xtdc(self, vip_server_only) -> int:
         """初始化xtdc服务进程"""
         if not self.get_lock():
-            return
+            return 0
 
         # 设置token
         xtdc.set_token(self.token)
+
+        # 设置是否只连接VIP服务器
+        if vip_server_only:
+            xtdc.set_allow_optmize_address(
+                [
+                    "115.231.218.73:55310",
+                    "115.231.218.79:55310",
+                    "218.16.123.11:55310",
+                    "218.16.123.27:55310",
+                ]
+            )
 
         # 开启使用期货真实夜盘时间
         xtdc.set_future_realtime_mode(True)
@@ -397,7 +451,7 @@ class XtMdApi:
         xtdc.init(False)
 
         # 设置监听端口58620
-        xtdc.listen(port=58620)
+        return xtdc.listen(port=(self.port, self.port + 50))
 
     def query_contracts(self) -> None:
         """查询合约信息"""
@@ -416,6 +470,9 @@ class XtMdApi:
         """查询股票合约信息"""
         xt_symbols: list[str] = []
         markets: list = ["沪深A股", "沪深转债", "沪深ETF", "沪深指数", "京市A股"]
+        new_exchanges = [Exchange.SSE, Exchange.SZSE, Exchange.BSE]
+        new_exchanges = [exchange for exchange in new_exchanges if exchange not in self.available_exchange]
+        self.available_exchange.extend(new_exchanges)
 
         for i in markets:
             names: list = xtdata.get_stock_list_in_sector(i)
@@ -469,6 +526,9 @@ class XtMdApi:
         """查询期货合约信息"""
         xt_symbols: list[str] = []
         markets: list = ["中金所期货", "上期所期货", "能源中心期货", "大商所期货", "郑商所期货", "广期所期货"]
+        new_exchanges = [Exchange.SHFE, Exchange.CFFEX, Exchange.INE, Exchange.DCE, Exchange.CZCE, Exchange.GFEX]
+        new_exchanges = [exchange for exchange in new_exchanges if exchange not in self.available_exchange]
+        self.available_exchange.extend(new_exchanges)
 
         for i in markets:
             names: list = xtdata.get_stock_list_in_sector(i)
@@ -518,16 +578,24 @@ class XtMdApi:
         """查询期权合约信息"""
         xt_symbols: list[str] = []
 
-        markets: list = [
-            "上证期权",
-            "深证期权",
-            "中金所期权",
-            "上期所期权",
-            "能源中心期权",
-            "大商所期权",
-            "郑商所期权",
-            "广期所期权",
-        ]
+        markets: list[str] = []
+        new_exchanges: list[Exchange] = []
+        if self.option_active:
+            markets.extend(
+                [
+                    "上证期权",
+                    "深证期权",
+                ]
+            )
+            new_exchanges.extend([Exchange.SSE, Exchange.SZSE])
+        if self.fut_option_active:
+            markets.extend(["中金所期权", "上期所期权", "能源中心期权", "大商所期权", "郑商所期权", "广期所期权"])
+            new_exchanges.extend(
+                [Exchange.CFFEX, Exchange.SHFE, Exchange.INE, Exchange.DCE, Exchange.CZCE, Exchange.GFEX]
+            )
+
+        new_exchanges = [exchange for exchange in new_exchanges if exchange not in self.available_exchange]
+        self.available_exchange.extend(new_exchanges)
 
         for i in markets:
             names: list = xtdata.get_stock_list_in_sector(i)
@@ -543,6 +611,9 @@ class XtMdApi:
                 contract = process_futures_option(xtdata.get_instrument_detail, xt_symbol, self.gateway_name)
 
             if contract:
+                # for CZCE options, xt will return two contracts for one option, one with one digit for year, which is the current official contract, and one with two digits for year, which is for long history convience, we just ignore the latter
+                if contract.vt_symbol in symbol_contract_map:
+                    continue
                 symbol_contract_map[contract.vt_symbol] = contract
 
                 self.gateway.on_contract(contract)
@@ -559,11 +630,9 @@ class XtMdApi:
         xt_symbol: str = req.symbol + "." + xt_exchange
 
         if xt_symbol not in self.subscribed:
-            xtdata.subscribe_quote(stock_code=xt_symbol, period="tick", callback=self.onMarketData)
+            #xtdata.subscribe_quote(stock_code=xt_symbol, period="tick", callback=self.onMarketData)
+            xtdata.subscribe_whole_quote([xt_symbol], callback=self.onMarketData)
             self.subscribed.add(xt_symbol)
-
-    def close(self) -> None:
-        """关闭连接"""
 
 
 class XtTdApi(XtQuantTraderCallback):
